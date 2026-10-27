@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="tile" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#151a2e"/>
+      <stop offset="1" stop-color="#0a0d18"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0" stop-color="#2ee6c5"/>
+      <stop offset="1" stop-color="#8b6cff"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.34" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#2ee6c5" stop-opacity="0.28"/>
+      <stop offset="1" stop-color="#2ee6c5" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#tile)"/>
+  <rect x="16" y="16" width="480" height="480" rx="112" fill="url(#glow)"/>
+  <rect x="17.5" y="17.5" width="477" height="477" rx="110.5" fill="none" stroke="#ffffff" stroke-opacity="0.08" stroke-width="3"/>
+  <!-- source: the voice -->
+  <circle cx="168" cy="256" r="40" fill="url(#wave)"/>
+  <!-- the echo: three arcs bouncing outward, fading with distance -->
+  <g fill="none" stroke="url(#wave)" stroke-linecap="round">
+    <path d="M 236 172 A 118 118 0 0 1 236 340" stroke-width="34"/>
+    <path d="M 296 126 A 182 182 0 0 1 296 386" stroke-width="30" stroke-opacity="0.72"/>
+    <path d="M 356 82 A 246 246 0 0 1 356 430" stroke-width="26" stroke-opacity="0.45"/>
+  </g>
+</svg>

@@ -1,0 +1,262 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Build only (skip release creation)'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        include:
+          - os: ubuntu-latest
+            script: linux
+            artifact_glob: |
+              dist/*.AppImage
+              dist/*.deb
+          - os: windows-latest
+            script: win
+            artifact_glob: |
+              dist/*.exe
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      # electron-builder reads `version` from package.json for artifact
+      # naming (e.g. Echo-1.0.0-x64.dmg). When we build from a
+      # git tag (v1.0.7) the package.json still says 1.0.0 by default,
+      # so artifact names drift from the release tag. Sync them here.
+      # `npm pkg set` is cross-platform and doesn't touch git.
+      - name: Sync package.json version from tag
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          echo "Tag version: $VERSION"
+          CURRENT=$(node -p "require('./package.json').version")
+          echo "Current package.json version: $CURRENT"
+          if [ "$VERSION" != "$CURRENT" ]; then
+            npm pkg set "version=$VERSION"
+            echo "Updated package.json to $VERSION"
+          else
+            echo "Version already matches tag"
+          fi
+
+      # Linux: install LinuxBuild dependencies so electron-builder can produce .deb / .AppImage
+      - name: Install Linux build dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            fakeroot dpkg rpm \
+            libgtk-3-0 libnotify4 libnss3 libxss1 libxtst6 \
+            xauth xvfb libasound2t64 ffmpeg \
+            python3 python3-venv python3-pip
+
+      # Windows: enable long paths for electron-builder
+      - name: Enable Windows long paths
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: git config --system core.longpaths true
+
+      - name: Build
+        shell: bash
+        env:
+          # Intentionally do NOT set CSC_LINK / WIN_CSC_LINK etc.
+          # electron-builder treats empty strings as "set but invalid"
+          # and tries to resolve them as certificate paths, producing
+          # "Env WIN_CSC_LINK is not correct" errors. Code signing is
+          # opt-in: add the secrets to the repo and wire them in here
+          # only when you have real certificates.
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npm run build:${{ matrix.script }} -- --publish never
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: echo-${{ matrix.os }}
+          path: ${{ matrix.artifact_glob }}
+          if-no-files-found: warn
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history for changelog)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - name: Generate commit changelog
+        id: changelog
+        shell: bash
+        run: |
+          CURRENT_TAG="${GITHUB_REF_NAME}"
+          REPO_URL="https://github.com/${{ github.repository }}"
+
+          PREV_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || true)
+          if [ -z "$PREV_TAG" ]; then
+            PREV_TAG=$(git tag --sort=-creatordate | grep -vx "${CURRENT_TAG}" | while read -r t; do
+              if git merge-base --is-ancestor "$t" "${CURRENT_TAG}" 2>/dev/null; then echo "$t"; break; fi
+            done | head -1)
+          fi
+
+          if [ -z "$PREV_TAG" ]; then
+            RANGE=""
+            RANGE_LABEL="Initial release"
+          else
+            RANGE="${PREV_TAG}..${CURRENT_TAG}"
+            RANGE_LABEL="[\`${PREV_TAG}...${CURRENT_TAG}\`](${REPO_URL}/compare/${PREV_TAG}...${CURRENT_TAG})"
+          fi
+
+          COMMIT_COUNT=$(git rev-list --count ${RANGE:-HEAD})
+          echo "Changelog range: ${RANGE:-<all commits>} (${COMMIT_COUNT} commits)"
+
+          FS_CHAR="$(printf '\037')"
+          git log ${RANGE:-} --reverse --pretty=format:'%H%x1f%s' | awk -v FS="$FS_CHAR" -v repo="$REPO_URL" '
+            {
+              short=substr($1,1,7); subj=$2; low=tolower(subj); clean=subj;
+              sub(/^([Ff]eat|[Ff]ix|[Dd]ocs|[Cc]hore|[Rr]efactor|[Pp]erf|[Tt]est|[Bb]uild|[Cc]i|[Ss]tyle)(\([^)]*\))?!?:[ ]*/, "", clean);
+              line="- " clean " ([`" short "`](" repo "/commit/" $1 "))";
+              if (low ~ /^(feat|add|introduc|new )/) f[++nf]=line;
+              else if (low ~ /(^fix|bug|hotfix)/) x[++nx]=line;
+              else if (low ~ /^(improv|update|refactor|perf|polish|enhance|optimi)/) m[++ni]=line;
+              else if (low ~ /^(doc|readme)/) d[++nd]=line;
+              else o[++no]=line;
+            }
+            END {
+              if (nf) { print "### Features"; print ""; for(i=1;i<=nf;i++) print f[i]; print "" }
+              if (nx) { print "### Fixes"; print ""; for(i=1;i<=nx;i++) print x[i]; print "" }
+              if (ni) { print "### Improvements"; print ""; for(i=1;i<=ni;i++) print m[i]; print "" }
+              if (nd) { print "### Documentation"; print ""; for(i=1;i<=nd;i++) print d[i]; print "" }
+              if (no) { print "### Other Changes"; print ""; for(i=1;i<=no;i++) print o[i]; print "" }
+            }' > CHANGELOG_SECTION.md
+
+          {
+            echo "### Summary"
+            echo ""
+            if [ -n "$PREV_TAG" ]; then
+              echo "This release includes **${COMMIT_COUNT} commits** since ${PREV_TAG}."
+            else
+              echo "First release of Echo — **${COMMIT_COUNT} commits**."
+            fi
+            echo ""
+            cat CHANGELOG_SECTION.md
+          } > WHATS_CHANGED.md
+
+          # Write combined body to file (multiline-safe)
+          cat > RELEASE_BODY.md << 'BODY_EOF'
+          ## Installation
+
+          Choose the artifact for your platform:
+
+          | Platform | File | Notes |
+          |---|---|---|
+          | **Windows** | `Echo-Setup-*.exe` | NSIS installer — installs app + adds to Start Menu |
+          | **Linux** | `*.deb` | Debian/Ubuntu — auto-pulls system deps (Python, ffmpeg, GTK) |
+          | **Linux** | `*.AppImage` | Universal — no install, just `chmod +x` and run |
+
+          > **macOS:** no pre-built build is shipped. The app is unsigned/un-notarized, so macOS Gatekeeper blocks it as "damaged". Run Echo from source instead:
+          > ```bash
+          > git clone https://github.com/mvsp333/Echo && cd Echo && ./setup.sh
+          > ```
+          > Requires Node.js 18+. See the [README](https://github.com/mvsp333/Echo#quick-start) for details.
+
+          ## First Run
+
+          On first launch, Echo opens the **Settings** window automatically for your **Google Gemini API key**.
+          Get a free key from [Google AI Studio](https://aistudio.google.com/). You can also edit `.env` directly.
+
+          ## Optional: Local Whisper (offline speech)
+
+          Install **Python 3.10+** and **ffmpeg**, then run:
+          ```bash
+          ./setup.sh --skip-install-system-deps
+          ```
+
+          ## Checksums
+
+          See `SHA256SUMS.txt` attached to this release.
+
+          BODY_EOF
+
+          {
+            echo ""
+            echo "## What's Changed"
+            echo ""
+            cat WHATS_CHANGED.md
+            echo ""
+            echo "**Full Changelog**: ${RANGE_LABEL}"
+          } >> RELEASE_BODY.md
+
+          echo "=== Final release body ==="
+          cat RELEASE_BODY.md
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          # Pick only the primary installer per platform. This intentionally drops:
+          #   - Windows portable EXE (we ship the NSIS installer)
+          #   - .blockmap files (electron-updater diff metadata)
+          #   - latest-*.yml (electron-updater channel metadata)
+          #   - Source archives (GitHub auto-generates these from the tag)
+          #
+          # The order below is the order files appear in the release page.
+          find artifacts -type f -name 'Echo-Setup-*.exe' \
+            -exec cp -v {} release/ \;
+          find artifacts -type f -name 'echo-app_*_amd64.deb' \
+            -exec cp -v {} release/ \;
+          find artifacts -type f -name '*.AppImage' \
+            -exec cp -v {} release/ \;
+          echo "--- Files selected for release ---"
+          ls -la release/
+
+      - name: Generate SHA256 checksums
+        working-directory: release
+        run: |
+          sha256sum * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: Echo ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          body_path: RELEASE_BODY.md
+          files: |
+            release/*
+          fail_on_unmatched_files: false
