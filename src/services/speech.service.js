@@ -689,6 +689,7 @@ class SpeechService extends EventEmitter {
     this.segmentBytes = 0;
     this.manualStopRequested = false;
     this.sessionLanguage = null;
+    this.transcriptionErrorReported = false;
     this._resetVadState();
     this.emit('recording-started');
     this.emit('status', 'Local Whisper recording started');
@@ -1641,9 +1642,13 @@ class SpeechService extends EventEmitter {
 
     const output = `${probe.stdout || ''}\n${probe.stderr || ''}`;
     const noModule = output.includes('No module named whisper');
-    const isHelpOutput = output.includes('usage:') || output.includes('whisper') || output.includes('options');
+    // Python's own errors mention the path it failed on ("can't open file
+    // ...whisper-script.py"), so the word "whisper" alone proves nothing.
+    // Require real CLI help text, and reject obvious launch failures.
+    const launchFailed = /can't open file|No such file or directory|is not recognized as/i.test(output);
+    const isHelpOutput = !launchFailed && /usage:/i.test(output);
 
-    if (!probe.error && probe.status === 0 && !noModule) {
+    if (!probe.error && probe.status === 0 && !noModule && !launchFailed) {
       return candidate;
     }
 
@@ -1913,6 +1918,11 @@ class SpeechService extends EventEmitter {
     const job = this.transcriptionChain.then(() => this._transcribeAndEmit(audioBuffer, { final, continuation }));
     this.transcriptionChain = job.catch((error) => {
       logger.error('Whisper segment transcription failed', { error: error.message });
+      // Tell the user once per session instead of failing silently clip after clip.
+      if (!this.transcriptionErrorReported) {
+        this.transcriptionErrorReported = true;
+        this.emit('error', `Voice transcription failed: ${error.message.split('\n')[0]}. Check Settings > Speech, or restart Echo.`);
+      }
     });
     return job;
   }

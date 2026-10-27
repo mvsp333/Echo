@@ -31,7 +31,10 @@ function resolveEnvPath() {
   }
 }
 const ENV_PATH = resolveEnvPath();
-require("dotenv").config({ path: ENV_PATH });
+// override: the app's own settings file is the source of truth. Without it,
+// WHISPER_* variables inherited from whatever launched the app (a terminal,
+// a script) silently win over the user's saved settings.
+require("dotenv").config({ path: ENV_PATH, override: true });
 
 // Format a value for a single .env line. Newlines are collapsed to spaces and
 // backslashes are kept verbatim (doubling them corrupts Windows paths on the
@@ -259,7 +262,11 @@ class ApplicationController {
         this.firstRunManager.ensureEnv();
         status = this.firstRunManager.getStatus();
         this.isFirstRun = status.needsOnboarding;
-        logger.info("First-run status", status);
+        logger.info("First-run status", {
+          ...status,
+          envPath: ENV_PATH,
+          userData: app.getPath("userData")
+        });
       } catch (e) {
         logger.warn("First-run check failed", { error: e.message });
         status = { needsOnboarding: false };
