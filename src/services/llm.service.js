@@ -19,6 +19,8 @@ class LLMService {
     this.isInitialized = false;
     this.requestCount = 0;
     this.errorCount = 0;
+    // model -> timestamp until which Google reported its quota as exhausted
+    this.quotaCooldownUntil = {};
     
     this.initializeClient();
   }
@@ -37,7 +39,7 @@ class LLMService {
     try {
       this.client = new GoogleGenAI({ apiKey });
       
-      // Use the configured model name (default: gemini-3.5-flash)
+      // Use the configured model name (see llm.gemini.model in config.js)
       this.model = config.get('llm.gemini.model');
       this.isInitialized = true;
       
@@ -78,6 +80,39 @@ class LLMService {
     }
   }
 
+  /**
+   * Primary + fallback models, minus any whose quota Google reported as
+   * exhausted (free tier: ~20 requests per model per day). Retrying those on
+   * every question only adds latency. If all are cooling down, try them all.
+   */
+  _modelChain(primary = this.model) {
+    const all = [primary, ...(config.get('llm.gemini.fallbackModels') || [])];
+    const now = Date.now();
+    const usable = all.filter((model) => !(this.quotaCooldownUntil[model] > now));
+    return usable.length ? usable : all;
+  }
+
+  /** On a 429, park the model until Google's stated retry time. */
+  _noteQuotaExhaustion(modelName, error) {
+    const message = String((error && error.message) || '');
+    if (!/HTTP 429|RESOURCE_EXHAUSTED|exceeded your current quota/i.test(message)) {
+      return;
+    }
+    let delayMs = 60000;
+    const retryDelay = message.match(/"retryDelay":\s*"(\d+(?:\.\d+)?)s"/);
+    const retryIn = message.match(/retry in (?:(\d+)h)?(?:(\d+)m)?(\d+(?:\.\d+)?)s/i);
+    if (retryDelay) {
+      delayMs = Number(retryDelay[1]) * 1000;
+    } else if (retryIn) {
+      delayMs = ((Number(retryIn[1]) || 0) * 3600 + (Number(retryIn[2]) || 0) * 60 + Number(retryIn[3])) * 1000;
+    }
+    this.quotaCooldownUntil[modelName] = Date.now() + delayMs;
+    logger.warn('Gemini quota exhausted; skipping model until it resets', {
+      model: modelName,
+      minutes: Math.round(delayMs / 60000)
+    });
+  }
+
   getGenerationConfig(overrides = {}) {
     const defaults = config.get('llm.gemini.generation') || {};
     const fallback = {
@@ -85,7 +120,7 @@ class LLMService {
       topK: 40,
       topP: 0.95,
       maxOutputTokens: 4096,
-      thinkingConfig: { thinkingBudget: 0 }
+      thinkingConfig: { thinkingLevel: 'minimal' }
     };
 
     const merged = { ...fallback, ...defaults, ...overrides };
@@ -815,11 +850,12 @@ class LLMService {
   }
 
   getIntelligentTranscriptionPrompt(activeSkill, programmingLanguage) {
-    let prompt = `# Intelligent Transcription Response System
+    const mode = String(activeSkill || 'general').toUpperCase();
+    let prompt = `# Live Interview Assistant
 
-Assume you are asked a question in ${activeSkill.toUpperCase()} mode. Your job is to intelligently respond to question/message with appropriate brevity.
-Assume you are in an interview and you need to perform best in ${activeSkill.toUpperCase()} mode.
-Always respond to the point, do not repeat the question or unnecessary information which is not related to ${activeSkill}.`;
+You are helping a candidate during a live job interview. The text below is what the interviewer just said, captured by speech recognition. Answer it so the candidate can respond immediately and confidently.
+
+The current mode is ${mode}. The mode only sets defaults (such as the coding language); it is NOT a filter. Answer every genuine interview question, whatever the topic: any programming language, DSA, SQL and databases, OS, networking, system design, cloud/DevOps, behavioral or HR questions.`;
 
     // Add programming language context if provided
     if (programmingLanguage) {
@@ -828,49 +864,26 @@ Always respond to the point, do not repeat the question or unnecessary informati
       const fenceTagMap = { cpp: 'cpp', c: 'c', python: 'python', java: 'java', javascript: 'javascript', js: 'javascript' };
       const languageTitle = languageMap[lang] || (lang.charAt(0).toUpperCase() + lang.slice(1));
       const fenceTag = fenceTagMap[lang] || lang || 'text';
-      prompt += `\n\nCODING CONTEXT: Respond ONLY in ${languageTitle}. All code blocks must use triple backticks with language tag \`\`\`${fenceTag}\`\`\`. Do not include other languages unless explicitly asked.`;
+      prompt += `\n\nCODING CONTEXT: Write code in ${languageTitle} by default, in code blocks tagged \`\`\`${fenceTag}\`\`\`. If the question is about a specific language or technology (e.g. "advantages of Python", "SQL joins"), answer about that one instead.`;
     }
 
     prompt += `
 
-## Response Rules:
+## How to answer
+- First line: a direct 1-2 sentence answer the candidate can say out loud right away
+- Then the key points as short bullets, with a brief example where it helps
+- No preamble, no restating the question, no filler, no "great question"
+- A coding or DSA problem with no code gets a complete, runnable solution in a tagged code block, plus its time and space complexity
+- A follow-up ("why?", "can you optimize it?", "what about edge cases?") refers to the previous question and answer in this conversation
 
-### If the transcription is casual conversation, greetings, or NOT related to ${activeSkill}:
-- Respond with: "Yeah, I'm listening. Ask your question relevant to ${activeSkill}."
-- Or similar brief acknowledgments like: "I'm here, what's your ${activeSkill} question?"
+## Speech-recognition errors
+- Words may be misheard (e.g. "async avat" = "async/await", "has map" = "hash map", "You buy on" = "Why Python")
+- Infer the intended interview question and answer it; never mention the typos
 
-### If the transcription IS relevant to ${activeSkill} or is a follow-up question:
-- Start with a direct 1-2 sentence answer the candidate can say out loud immediately
-- Then give the key points as short bullets, with an example where it helps
-- Keep the whole answer tight: no preamble, no restating the question, no filler
-- Coding/DSA problems still get a complete solution (see below)
-
-### Speech-to-text errors:
-- The text comes from live speech recognition and may contain misheard words
-  (e.g. "async avat" = "async/await", "hash map" heard as "has map", "Why Python" heard as "You buy on")
-- Infer the most likely intended technical question and answer that; do not comment on the typos
-
-### Examples of casual/irrelevant messages:
-- "Hello", "Hi there", "How are you?"
-- "What's the weather like?"
-- "I'm just testing this"
-- Random conversations not related to ${activeSkill}
-
-### Examples of relevant messages:
-- Actual questions about ${activeSkill} concepts
-- Follow-up questions to previous responses
-- Requests for clarification on ${activeSkill} topics
-- Problem-solving requests related to ${activeSkill}
-
-## Response Format:
-- Direct answer first, details after
-- Use bullet points for structured answers
-- Be encouraging and helpful
-- Stay focused on ${activeSkill}
-
-If the user's input is a coding or DSA problem statement and contains no code, produce a complete, runnable solution in the selected programming language without asking for more details. Always include the final implementation in a properly tagged code block.
-
-Remember: Be intelligent about filtering - only provide detailed responses when the user actually needs help with ${activeSkill}.`;
+## When there is nothing to answer
+If the text is clearly not something said to the candidate as a question or request (small talk like "can you hear me?", filler, video or background narration such as "please subscribe to our channel", or meaningless fragments), reply with exactly:
+[SKIP]
+and nothing else. When in doubt, answer.`;
 
     return prompt;
   }
@@ -883,8 +896,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     const maxRetries = config.get('llm.gemini.maxRetries');
     const timeout = config.get('llm.gemini.timeout');
     const primaryModel = this.model;
-    const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-    const modelsToTry = [primaryModel, ...fallbackModels];
+    const modelsToTry = this._modelChain(primaryModel);
 
     logger.debug('Executing Gemini request', {
       hasModel: !!this.model,
@@ -943,6 +955,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
 
           return text;
         } catch (error) {
+          this._noteQuotaExhaustion(modelName, error);
           const errorInfo = this.analyzeError(error);
           lastError = error;
 
@@ -1101,8 +1114,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     const maxRetries = config.get('llm.gemini.maxRetries');
     const apiKey = config.getApiKey('GEMINI');
     const primaryModel = this.model;
-    const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-    const modelsToTry = [primaryModel, ...fallbackModels];
+    const modelsToTry = this._modelChain(primaryModel);
 
     let lastError = null;
 
@@ -1126,6 +1138,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
           if (error.name === 'AbortError') {
             throw error;
           }
+          this._noteQuotaExhaustion(modelName, error);
           const errorInfo = this.analyzeError(error);
           lastError = error;
 
@@ -1651,8 +1664,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
     const https = require('https');
     const apiKey = config.getApiKey('GEMINI');
     const primaryModel = config.get('llm.gemini.model');
-    const fallbackModels = config.get('llm.gemini.fallbackModels') || [];
-    const modelsToTry = [primaryModel, ...fallbackModels];
+    const modelsToTry = this._modelChain(primaryModel);
 
     logger.info('Using alternative HTTPS request method', { modelsToTry });
 
@@ -1664,6 +1676,7 @@ Remember: Be intelligent about filtering - only provide detailed responses when 
         return result;
       } catch (error) {
         lastError = error;
+        this._noteQuotaExhaustion(modelName, error);
         logger.warn(`Alternative HTTPS request failed for model ${modelName}`, {
           error: error.message,
           model: modelName

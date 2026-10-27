@@ -1248,13 +1248,15 @@
         }
 
         whysperAPI.onTranscriptionLlmResponse((event, data) => {
-          if (data && data.response) {
-            try { hideThinkingIndicator(); } catch (_) {}
-            const entry = data.messageId && streamBubbles.get(data.messageId);
-            if (entry) {
-              entry.messageDiv.remove();
-              streamBubbles.delete(data.messageId);
-            }
+          if (!data) return;
+          try { hideThinkingIndicator(); } catch (_) {}
+          const entry = data.messageId && streamBubbles.get(data.messageId);
+          if (entry) {
+            entry.messageDiv.remove();
+            streamBubbles.delete(data.messageId);
+          }
+          // An empty final response means "nothing to answer": just drop the bubble.
+          if (data.response) {
             renderAssistantResponse(data.response);
           }
         });

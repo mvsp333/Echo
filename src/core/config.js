@@ -40,10 +40,19 @@ class ConfigManager {
 
       llm: {
         gemini: {
-          model: 'gemini-3.1-flash-lite',
-          fallbackModels: ['gemini-2.5-flash-lite', 'gemini-3.5-flash'],
-          maxRetries: 3,
+          // Measured from a free-tier key: 3.5-flash-lite starts streaming in
+          // ~0.7s; 3.1-flash-lite took 5-21s and the 2.5 models are retired.
+          // Each model has its own free quota, so a 429 on one moves to the next.
+          // Tried and left out: flash-lite-latest / 3.1-flash-lite-preview
+          // (5-10s to start), flash-latest (often overloaded), omni (no free quota).
+          model: 'gemini-3.5-flash-lite',
+          fallbackModels: ['gemini-3.6-flash', 'gemini-3-flash-preview', 'gemini-3.5-flash', 'gemini-3.1-flash-lite'],
+          maxRetries: 2,
           timeout: 30000,
+          // Free-tier first-token times swing 0.7-5s; switching too early lands
+          // on a slower model, so allow a little headroom before giving up.
+          firstTokenTimeoutMs: 7000,
+          streamIdleTimeoutMs: 8000,
           fallbackEnabled: true,
           enableFallbackMethod: true,
           generation: {
@@ -51,7 +60,9 @@ class ConfigManager {
             topK: 32,
             topP: 0.9,
             maxOutputTokens: 4096,
-            thinkingConfig: { thinkingBudget: 0 }
+            // Gemini 3.5+ rejects thinkingBudget; thinkingLevel works on every
+            // model in the chain above.
+            thinkingConfig: { thinkingLevel: 'minimal' }
           }
         }
       },

@@ -26,6 +26,11 @@ model_device = None
 model_backend = None
 model_effective_backend = None
 
+# A decoded segment is discarded when Whisper itself rates it probably not
+# speech and has low confidence in the words (typical of hallucinations).
+NO_SPEECH_DROP = 0.5
+LOGPROB_DROP = -0.7
+
 # openai-whisper model names that faster-whisper publishes under another id.
 FASTER_MODEL_ALIASES = {
     'large': 'large-v3',
@@ -201,11 +206,26 @@ def transcribe(request):
             no_speech_threshold=0.6,
             condition_on_previous_text=False,
             without_timestamps=True,
-            vad_filter=False,
+            # Silero speech detection: strips music, chimes and hum before
+            # decoding, so non-speech audio yields no text instead of an
+            # invented sentence ("This is the end of the session.").
+            vad_filter=True,
+            vad_parameters={'min_silence_duration_ms': 500, 'speech_pad_ms': 300},
             initial_prompt=initial_prompt,
             max_new_tokens=max_tokens,
         )
-        text = ''.join(segment.text for segment in segments)
+        kept = []
+        dropped = []
+        for segment in segments:
+            # Whisper's own verdict: likely non-speech AND unsure of the words.
+            if segment.no_speech_prob > NO_SPEECH_DROP and segment.avg_logprob < LOGPROB_DROP:
+                dropped.append(segment.text.strip())
+                continue
+            kept.append(segment.text)
+        if dropped:
+            sys.stderr.write(f'dropped low-confidence non-speech text: {dropped!r}\n')
+            sys.stderr.flush()
+        text = ''.join(kept)
         detected = info.language
     else:
         options = {'sample_len': max_tokens} if max_tokens else {}

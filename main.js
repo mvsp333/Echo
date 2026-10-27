@@ -1347,6 +1347,10 @@ class ApplicationController {
     if (held && Date.now() - held.at < 8000) {
       text = `${held.text} ${text}`;
     }
+    if (!speechService.isManualCaptureMode() && this.isCallChatter(fragment)) {
+      logger.info("Ignoring call chatter", { text: fragment.substring(0, 80) });
+      return;
+    }
     if (!speechService.isManualCaptureMode() && !this.looksLikeQuestion(text)) {
       this._heldFragment = { text, at: Date.now() };
       logger.debug("Holding short non-question fragment", { text: text.substring(0, 80) });
@@ -1408,6 +1412,21 @@ class ApplicationController {
     return matched / (heard.length - 1) >= 0.5;
   }
 
+  /**
+   * Call logistics and pleasantries ("can you hear me?", "you're on mute",
+   * "let me share my screen"). Short utterances that are only that never go
+   * to the model: they'd waste free-tier quota and get a pointless answer.
+   */
+  isCallChatter(text) {
+    const words = text.trim().split(/\s+/).filter(Boolean);
+    if (words.length > 10) {
+      return false;
+    }
+    const normalized = text.toLowerCase().replace(/[^a-z' ]+/g, " ").replace(/\s+/g, " ").trim();
+    return /\b(can|could) you (hear|see) me\b|\bam i audible\b|\b(you'?re|you are|i'?m|i am) on mute\b|\b(un)?mute\b|\bshare (my|your) screen\b|\b(can|could) you see my screen\b|\bis my (screen|voice|audio) (visible|clear|okay|ok)\b|\b(give me|one|just a) (a )?(second|sec|minute|moment)\b|\byour (voice|audio) is (breaking|cutting|not clear)\b|\b(good (morning|afternoon|evening)|nice to meet you|thank you|thanks|bye|see you)\b/.test(normalized)
+      && !/\b(what|why|how|explain|difference|implement|write|design|complexity|algorithm|code)\b/.test(normalized);
+  }
+
   looksLikeQuestion(text) {
     const words = text.trim().split(/\s+/).filter(Boolean);
     if (/\?/.test(text) || words.length >= 6) {
@@ -1465,15 +1484,31 @@ class ApplicationController {
       };
       this._lastVoiceAnswer = answer;
       this._recentVoiceAnswers = [...this._recentVoiceAnswers.slice(-4), answer];
-      this.sendToVoiceResponseWindows("transcription-llm-response-start", {
-        messageId,
-        skill: this.activeSkill,
-        // Same bubble, new question text: the window clears what it streamed.
-        reset: Boolean(reuseMessageId)
-      });
-      if (this.shouldShowVoiceOverlay()) {
-        windowManager.showLLMLoading();
-      }
+
+      // Nothing is shown until the first real words arrive (~1s), so a
+      // [SKIP] verdict for chatter or background audio leaves the screen
+      // untouched instead of flashing an empty answer.
+      const SKIP = "[SKIP]";
+      const overlay = this.shouldShowVoiceOverlay();
+      let visible = false;
+      let held = "";
+      const reveal = () => {
+        visible = true;
+        this.sendToVoiceResponseWindows("transcription-llm-response-start", {
+          messageId,
+          skill: this.activeSkill,
+          // Same bubble, new question text: the window clears what it streamed.
+          reset: Boolean(reuseMessageId)
+        });
+        if (overlay && this._lastVoiceAnswer === answer) {
+          windowManager.showLLMLoading();
+        }
+      };
+      const forward = (delta) => {
+        this.sendToVoiceResponseWindows("transcription-llm-response-chunk", { messageId, delta });
+      };
+      const isSkip = (value) => value.trim().startsWith(SKIP);
+
       const llmResult = await llmService.processTranscriptionWithIntelligentResponseStream(
         cleanText,
         this.activeSkill,
@@ -1481,26 +1516,50 @@ class ApplicationController {
         needsProgrammingLanguage ? this.codingLanguage : null,
         (delta) => {
           answer.streamedText += delta;
-          this.sendToVoiceResponseWindows("transcription-llm-response-chunk", {
-            messageId,
-            delta
-          });
+          if (visible) {
+            forward(delta);
+            return;
+          }
+          held += delta;
+          const start = held.trimStart();
+          if (start.length < SKIP.length && SKIP.startsWith(start)) {
+            return; // might still turn out to be [SKIP]
+          }
+          if (isSkip(held)) {
+            answer.skipped = true;
+            answer.controller.abort();
+            return;
+          }
+          reveal();
+          forward(held);
         },
         {
           signal: answer.controller.signal,
           // A stalled stream is regenerated on another model: clear the bubble.
           onReset: () => {
             answer.streamedText = "";
-            this.sendToVoiceResponseWindows("transcription-llm-response-start", {
-              messageId,
-              skill: this.activeSkill,
-              reset: true
-            });
+            held = "";
+            if (visible) {
+              this.sendToVoiceResponseWindows("transcription-llm-response-start", {
+                messageId,
+                skill: this.activeSkill,
+                reset: true
+              });
+            }
           }
         }
       );
       answer.done = true;
       llmResult.metadata = { ...llmResult.metadata, messageId };
+
+      if (isSkip(llmResult.response || "")) {
+        logger.info("No answer needed for this speech", { text: cleanText.substring(0, 80) });
+        if (visible) {
+          // Remove the bubble that was opened before the verdict was known.
+          this.sendTranscriptionLLMResponseToVoiceTargets({ ...llmResult, response: "" });
+        }
+        return;
+      }
 
       // Add LLM response to session memory
       sessionManager.addModelResponse(llmResult.response, {
@@ -1512,7 +1571,7 @@ class ApplicationController {
 
       this.sendTranscriptionLLMResponseToVoiceTargets(llmResult);
       // With answers running in parallel, only the newest one owns the overlay.
-      if (this.shouldShowVoiceOverlay() && this._lastVoiceAnswer === answer) {
+      if (overlay && this._lastVoiceAnswer === answer) {
         windowManager.showLLMResponse(llmResult.response, {
           skill: this.activeSkill,
           processingTime: llmResult.metadata.processingTime,
@@ -1533,7 +1592,11 @@ class ApplicationController {
         answer.done = true;
       }
       if (error.name === 'AbortError') {
-        // Superseded by a merged re-ask that streams into the same bubble.
+        // Superseded by a merged re-ask that streams into the same bubble,
+        // or the model judged the speech not worth answering ([SKIP]).
+        if (answer && answer.skipped) {
+          logger.info("No answer needed for this speech", { text: text.substring(0, 80) });
+        }
         return;
       }
       logger.error("Transcription LLM processing failed", {

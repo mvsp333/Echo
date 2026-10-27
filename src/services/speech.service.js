@@ -2039,7 +2039,12 @@ class SpeechService extends EventEmitter {
       'the end',
       'subtitles by the amara org community'
     ]);
-    return HALLUCINATIONS.has(normalized);
+    if (HALLUCINATIONS.has(normalized)) {
+      return true;
+    }
+    // YouTube-style sign-offs: Whisper invents these from music and noise
+    // (they dominate its training captions), and no interviewer says them.
+    return /\b(subscribe to (our|my|the) channel|like and subscribe|please subscribe|thanks? (you )?for watching|see you (in the )?next (video|time)|don'?t forget to subscribe|hit the bell)\b/.test(normalized);
   }
 
   /**
