@@ -17,6 +17,10 @@ async function main() {
     console.error('Connection test failed:', error.message);
     process.exitCode = 1;
   }
+
+  // The service keeps a Whisper worker process alive for fast transcription;
+  // close it or this script would never exit.
+  speechService.shutdown();
 }
 
 main().catch((error) => {

@@ -1163,6 +1163,25 @@ class SpeechService extends EventEmitter {
       if (!this.whisperCommand) {
         return { success: false, message: 'Local Whisper CLI not found' };
       }
+      // The persistent worker is what transcription actually uses, so test it
+      // first. The CLI is only its fallback.
+      if (this.whisperWorker.isConfigured()) {
+        try {
+          const result = await this.whisperWorker.warmup({
+            model: this._getWhisperModel(),
+            modelDir: this._getWhisperModelDir(),
+            device: this._getWhisperDevice(),
+            backend: this._getWhisperBackend()
+          });
+          return {
+            success: true,
+            message: `Whisper worker ready: ${result.model} on ${result.device} (${result.backend})`
+          };
+        } catch (error) {
+          logger.warn('Whisper worker test failed; probing CLI fallback', { error: error.message });
+        }
+      }
+
       // Actually probe the executable to confirm it works
       const probe = spawnSync(
         this.whisperCommand.command,
